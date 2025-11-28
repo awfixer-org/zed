@@ -405,6 +405,7 @@ pub fn main() {
     });
 
     app.run(move |cx| {
+        session::init(cx);
         menu::init();
         zed_actions::init();
 
