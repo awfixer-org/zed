@@ -16764,6 +16764,7 @@ dependencies = [
  "rpc",
  "schemars",
  "serde",
+ "session",
  "settings",
  "smallvec",
  "story",
