@@ -2,8 +2,11 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
+use url::Url;
 use zed_extension_api::http_client::{HttpMethod, HttpRequest, HttpResponseStream, RedirectPolicy};
 use zed_extension_api::{self as zed, *};
+
+const GITHUB_COPILOT_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
 
 struct CopilotChatProvider {
     streams: Mutex<HashMap<String, StreamState>>,
@@ -466,13 +469,11 @@ impl zed::Extension for CopilotChatProvider {
 
 Welcome to **Copilot Chat**! This extension provides access to GitHub Copilot's chat models.
 
-## Configuration
+## Authentication
 
-Enter your GitHub Copilot token below. You need an active GitHub Copilot subscription.
+Click **Sign in with GitHub** to authenticate with your GitHub account. You'll be redirected to GitHub to authorize access. This requires an active GitHub Copilot subscription.
 
-To get your token:
-1. Ensure you have a GitHub Copilot subscription
-2. Generate a token from your GitHub Copilot settings
+Alternatively, you can set the `GH_COPILOT_TOKEN` environment variable with your token.
 
 ## Available Models
 
@@ -503,17 +504,78 @@ This extension requires an active GitHub Copilot subscription.
     }
 
     fn llm_provider_authenticate(&mut self, _provider_id: &str) -> Result<(), String> {
-        let provided = llm_request_credential(
-            "copilot-chat",
-            LlmCredentialType::ApiKey,
-            "GitHub Copilot Token",
-            "ghu_...",
-        )?;
-        if provided {
-            Ok(())
-        } else {
-            Err("Authentication cancelled".to_string())
+        let state = generate_random_state();
+
+        let result = llm_oauth_start_web_auth(&LlmOauthWebAuthConfig {
+            auth_url: format!(
+                "https://github.com/login/oauth/authorize?client_id={}&scope=read:user&state={}",
+                GITHUB_COPILOT_CLIENT_ID, state
+            ),
+            callback_path: "/callback".to_string(),
+            timeout_secs: Some(300),
+        })?;
+
+        let callback_url = Url::parse(&result.callback_url)
+            .map_err(|e| format!("Failed to parse callback URL: {}", e))?;
+
+        let params: HashMap<_, _> = callback_url.query_pairs().collect();
+
+        let returned_state = params
+            .get("state")
+            .ok_or("Missing state parameter in callback")?;
+        if returned_state != &state {
+            return Err("State mismatch - possible CSRF attack".to_string());
         }
+
+        let code = params
+            .get("code")
+            .ok_or("Missing authorization code in callback")?;
+
+        let token_response = llm_oauth_http_request(&LlmOauthHttpRequest {
+            url: "https://github.com/login/oauth/access_token".to_string(),
+            method: "POST".to_string(),
+            headers: vec![
+                ("Accept".to_string(), "application/json".to_string()),
+                (
+                    "Content-Type".to_string(),
+                    "application/x-www-form-urlencoded".to_string(),
+                ),
+            ],
+            body: format!(
+                "client_id={}&code={}&redirect_uri=http://localhost:{}/callback",
+                GITHUB_COPILOT_CLIENT_ID, code, result.port
+            ),
+        })?;
+
+        if token_response.status != 200 {
+            return Err(format!(
+                "Token exchange failed: HTTP {}",
+                token_response.status
+            ));
+        }
+
+        #[derive(Deserialize)]
+        struct TokenResponse {
+            access_token: Option<String>,
+            error: Option<String>,
+            error_description: Option<String>,
+        }
+
+        let token_json: TokenResponse = serde_json::from_str(&token_response.body)
+            .map_err(|e| format!("Failed to parse token response: {}", e))?;
+
+        if let Some(error) = token_json.error {
+            let description = token_json.error_description.unwrap_or_default();
+            return Err(format!("OAuth error: {} - {}", error, description));
+        }
+
+        let access_token = token_json
+            .access_token
+            .ok_or("No access_token in response")?;
+
+        llm_store_credential("copilot-chat", &access_token)?;
+
+        Ok(())
     }
 
     fn llm_provider_reset_credentials(&mut self, _provider_id: &str) -> Result<(), String> {
@@ -691,6 +753,14 @@ This extension requires an active GitHub Copilot subscription.
     fn llm_stream_completion_close(&mut self, stream_id: &str) {
         self.streams.lock().unwrap().remove(stream_id);
     }
+}
+
+fn generate_random_state() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{:x}{:x}", duration.as_secs(), duration.subsec_nanos())
 }
 
 zed::register_extension!(CopilotChatProvider);
