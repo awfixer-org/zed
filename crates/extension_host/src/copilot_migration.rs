@@ -2,8 +2,8 @@ use credentials_provider::CredentialsProvider;
 use gpui::App;
 use std::path::PathBuf;
 
-const COPILOT_CHAT_EXTENSION_ID: &str = "copilot_chat";
-const COPILOT_CHAT_PROVIDER_ID: &str = "copilot_chat";
+const COPILOT_CHAT_EXTENSION_ID: &str = "copilot-chat";
+const COPILOT_CHAT_PROVIDER_ID: &str = "copilot-chat";
 
 pub fn migrate_copilot_credentials_if_needed(extension_id: &str, cx: &mut App) {
     if extension_id != COPILOT_CHAT_EXTENSION_ID {

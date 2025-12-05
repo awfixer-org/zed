@@ -427,7 +427,7 @@ impl zed::Extension for CopilotChatProvider {
 
     fn llm_providers(&self) -> Vec<LlmProviderInfo> {
         vec![LlmProviderInfo {
-            id: "copilot_chat".into(),
+            id: "copilot-chat".into(),
             name: "Copilot Chat".into(),
             icon: Some("icons/copilot.svg".into()),
         }]
@@ -457,7 +457,7 @@ impl zed::Extension for CopilotChatProvider {
     }
 
     fn llm_provider_is_authenticated(&self, _provider_id: &str) -> bool {
-        llm_get_credential("copilot_chat").is_some()
+        llm_get_credential("copilot-chat").is_some()
     }
 
     fn llm_provider_settings_markdown(&self, _provider_id: &str) -> Option<String> {
@@ -504,7 +504,7 @@ This extension requires an active GitHub Copilot subscription.
 
     fn llm_provider_authenticate(&mut self, _provider_id: &str) -> Result<(), String> {
         let provided = llm_request_credential(
-            "copilot_chat",
+            "copilot-chat",
             LlmCredentialType::ApiKey,
             "GitHub Copilot Token",
             "ghu_...",
@@ -517,7 +517,7 @@ This extension requires an active GitHub Copilot subscription.
     }
 
     fn llm_provider_reset_credentials(&mut self, _provider_id: &str) -> Result<(), String> {
-        llm_delete_credential("copilot_chat")
+        llm_delete_credential("copilot-chat")
     }
 
     fn llm_stream_completion_start(
@@ -526,7 +526,7 @@ This extension requires an active GitHub Copilot subscription.
         model_id: &str,
         request: &LlmCompletionRequest,
     ) -> Result<String, String> {
-        let api_key = llm_get_credential("copilot_chat").ok_or_else(|| {
+        let api_key = llm_get_credential("copilot-chat").ok_or_else(|| {
             "No token configured. Please add your GitHub Copilot token in settings.".to_string()
         })?;
 

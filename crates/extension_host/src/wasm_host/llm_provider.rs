@@ -10,7 +10,7 @@ use crate::wasm_host::wit::{
 use anyhow::{Result, anyhow};
 use credentials_provider::CredentialsProvider;
 use editor::Editor;
-use extension::LanguageModelAuthConfig;
+use extension::{LanguageModelAuthConfig, OAuthConfig};
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt};
@@ -315,6 +315,7 @@ struct ExtensionProviderConfigurationView {
     api_key_editor: Entity<Editor>,
     loading_settings: bool,
     loading_credentials: bool,
+    oauth_in_progress: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -352,6 +353,7 @@ impl ExtensionProviderConfigurationView {
             api_key_editor,
             loading_settings: true,
             loading_credentials: true,
+            oauth_in_progress: false,
             _subscriptions: vec![state_subscription],
         };
 
@@ -600,8 +602,79 @@ impl ExtensionProviderConfigurationView {
         .detach();
     }
 
+    fn start_oauth_sign_in(&mut self, cx: &mut Context<Self>) {
+        if self.oauth_in_progress {
+            return;
+        }
+
+        self.oauth_in_progress = true;
+        cx.notify();
+
+        let extension = self.extension.clone();
+        let provider_id = self.extension_provider_id.clone();
+        let state = self.state.clone();
+
+        cx.spawn(async move |this, cx| {
+            let result = extension
+                .call({
+                    let provider_id = provider_id.clone();
+                    |ext, store| {
+                        async move {
+                            ext.call_llm_provider_authenticate(store, &provider_id)
+                                .await
+                        }
+                        .boxed()
+                    }
+                })
+                .await;
+
+            this.update(cx, |this, cx| {
+                this.oauth_in_progress = false;
+                cx.notify();
+            })
+            .log_err();
+
+            match result {
+                Ok(Ok(Ok(()))) => {
+                    let _ = cx.update(|cx| {
+                        state.update(cx, |state, cx| {
+                            state.is_authenticated = true;
+                            cx.notify();
+                        });
+                    });
+                }
+                Ok(Ok(Err(e))) => {
+                    log::error!("OAuth authentication failed: {}", e);
+                }
+                Ok(Err(e)) => {
+                    log::error!("OAuth authentication error: {}", e);
+                }
+                Err(e) => {
+                    log::error!("OAuth authentication error: {}", e);
+                }
+            }
+        })
+        .detach();
+    }
+
     fn is_authenticated(&self, cx: &Context<Self>) -> bool {
         self.state.read(cx).is_authenticated
+    }
+
+    fn has_oauth_config(&self) -> bool {
+        self.auth_config.as_ref().is_some_and(|c| c.oauth.is_some())
+    }
+
+    fn oauth_config(&self) -> Option<&OAuthConfig> {
+        self.auth_config.as_ref().and_then(|c| c.oauth.as_ref())
+    }
+
+    fn has_api_key_config(&self) -> bool {
+        // API key is available if there's a credential_label or no oauth-only config
+        self.auth_config
+            .as_ref()
+            .map(|c| c.credential_label.is_some() || c.oauth.is_none())
+            .unwrap_or(true)
     }
 }
 
@@ -611,6 +684,8 @@ impl gpui::Render for ExtensionProviderConfigurationView {
         let is_authenticated = self.is_authenticated(cx);
         let env_var_allowed = self.state.read(cx).env_var_allowed;
         let api_key_from_env = self.state.read(cx).api_key_from_env;
+        let has_oauth = self.has_oauth_config();
+        let has_api_key = self.has_api_key_config();
 
         if is_loading {
             return v_flex()
@@ -680,7 +755,7 @@ impl gpui::Render for ExtensionProviderConfigurationView {
                                 )
                                 .child(
                                     Label::new(format!(
-                                        "{} is not set or empty. You can set it and restart Zed, or enter an API key below.",
+                                        "{} is not set or empty. You can set it and restart Zed, or use another authentication method below.",
                                         env_var_name
                                     ))
                                     .color(Color::Warning)
@@ -692,8 +767,20 @@ impl gpui::Render for ExtensionProviderConfigurationView {
             }
         }
 
-        // Render API key section
+        // If authenticated, show success state with sign out option
         if is_authenticated && !api_key_from_env {
+            let reset_label = if has_oauth && !has_api_key {
+                "Sign Out"
+            } else {
+                "Reset Credentials"
+            };
+
+            let status_label = if has_oauth && !has_api_key {
+                "Signed in"
+            } else {
+                "Authenticated"
+            };
+
             content = content.child(
                 v_flex()
                     .gap_2()
@@ -705,39 +792,88 @@ impl gpui::Render for ExtensionProviderConfigurationView {
                                     .color(Color::Success)
                                     .size(ui::IconSize::Small),
                             )
-                            .child(Label::new("API key configured").color(Color::Success)),
+                            .child(Label::new(status_label).color(Color::Success)),
                     )
                     .child(
-                        ui::Button::new("reset-api-key", "Reset API Key")
+                        ui::Button::new("reset-credentials", reset_label)
                             .style(ui::ButtonStyle::Subtle)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.reset_api_key(window, cx);
                             })),
                     ),
             );
-        } else if !api_key_from_env {
-            let credential_label = self
-                .auth_config
-                .as_ref()
-                .and_then(|c| c.credential_label.clone())
-                .unwrap_or_else(|| "API Key".to_string());
 
-            content = content.child(
-                v_flex()
-                    .gap_2()
-                    .on_action(cx.listener(Self::save_api_key))
-                    .child(
-                        Label::new(credential_label)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(self.api_key_editor.clone())
-                    .child(
-                        Label::new("Enter your API key and press Enter to save")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    ),
-            );
+            return content.into_any_element();
+        }
+
+        // Not authenticated - show available auth options
+        if !api_key_from_env {
+            // Render OAuth sign-in button if configured
+            if has_oauth {
+                let oauth_config = self.oauth_config();
+                let button_label = oauth_config
+                    .and_then(|c| c.sign_in_button_label.clone())
+                    .unwrap_or_else(|| "Sign In".to_string());
+
+                let oauth_in_progress = self.oauth_in_progress;
+
+                content = content.child(
+                    v_flex()
+                        .gap_2()
+                        .child(
+                            ui::Button::new("oauth-sign-in", button_label)
+                                .style(ui::ButtonStyle::Filled)
+                                .disabled(oauth_in_progress)
+                                .on_click(cx.listener(|this, _, _window, cx| {
+                                    this.start_oauth_sign_in(cx);
+                                })),
+                        )
+                        .when(oauth_in_progress, |this| {
+                            this.child(
+                                Label::new("Waiting for authentication...")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                        }),
+                );
+            }
+
+            // Render API key input if configured (and we have both options, show a separator)
+            if has_api_key {
+                if has_oauth {
+                    content = content.child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(div().h_px().flex_1().bg(cx.theme().colors().border))
+                            .child(Label::new("or").size(LabelSize::Small).color(Color::Muted))
+                            .child(div().h_px().flex_1().bg(cx.theme().colors().border)),
+                    );
+                }
+
+                let credential_label = self
+                    .auth_config
+                    .as_ref()
+                    .and_then(|c| c.credential_label.clone())
+                    .unwrap_or_else(|| "API Key".to_string());
+
+                content = content.child(
+                    v_flex()
+                        .gap_2()
+                        .on_action(cx.listener(Self::save_api_key))
+                        .child(
+                            Label::new(credential_label)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(self.api_key_editor.clone())
+                        .child(
+                            Label::new("Enter your API key and press Enter to save")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
+                );
+            }
         }
 
         content.into_any_element()
