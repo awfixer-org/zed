@@ -84,6 +84,10 @@ impl EntityMap {
         }
     }
 
+    pub fn ref_counts_drop(&self) -> impl Sized + use<> {
+        self.ref_counts.clone()
+    }
+
     /// Reserve a slot for an entity, which you can subsequently use with `insert`.
     pub fn reserve<T: 'static>(&self) -> Slot<T> {
         let id = self.ref_counts.write().counts.insert(1.into());
