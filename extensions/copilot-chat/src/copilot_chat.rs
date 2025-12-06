@@ -1,14 +1,14 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::thread;
+use std::time::Duration;
 
-use base64::Engine;
-use rand::Rng;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use url::Url;
 use zed_extension_api::http_client::{HttpMethod, HttpRequest, HttpResponseStream, RedirectPolicy};
 use zed_extension_api::{self as zed, *};
 
+const GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
+const GITHUB_ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 const GITHUB_COPILOT_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
 
 struct CopilotChatProvider {
@@ -513,43 +513,15 @@ This extension requires an active GitHub Copilot subscription.
         }
 
         // No credentials found - return error for background auth checks.
-        // The OAuth flow will be triggered by the host when the user clicks
+        // The device flow will be triggered by the host when the user clicks
         // the "Sign in with GitHub" button, which calls llm_provider_start_oauth_sign_in.
         Err("CredentialsNotFound".to_string())
     }
 
     fn llm_provider_start_oauth_sign_in(&mut self, _provider_id: &str) -> Result<(), String> {
-        let state = generate_random_state();
-        let code_verifier = generate_pkce_verifier();
-        let code_challenge = generate_pkce_challenge(&code_verifier);
-
-        let result = llm_oauth_start_web_auth(&LlmOauthWebAuthConfig {
-            auth_url: format!(
-                "https://github.com/login/oauth/authorize?client_id={}&redirect_uri=http://127.0.0.1:{{port}}/callback&scope=read:user&state={}&code_challenge={}&code_challenge_method=S256",
-                GITHUB_COPILOT_CLIENT_ID, state, code_challenge
-            ),
-            callback_path: "/callback".to_string(),
-            timeout_secs: Some(300),
-        })?;
-
-        let callback_url = Url::parse(&result.callback_url)
-            .map_err(|e| format!("Failed to parse callback URL: {}", e))?;
-
-        let params: HashMap<_, _> = callback_url.query_pairs().collect();
-
-        let returned_state = params
-            .get("state")
-            .ok_or("Missing state parameter in callback")?;
-        if returned_state != &state {
-            return Err("State mismatch - possible CSRF attack".to_string());
-        }
-
-        let code = params
-            .get("code")
-            .ok_or("Missing authorization code in callback")?;
-
-        let token_response = llm_oauth_http_request(&LlmOauthHttpRequest {
-            url: "https://github.com/login/oauth/access_token".to_string(),
+        // Step 1: Request device and user verification codes
+        let device_code_response = llm_oauth_http_request(&LlmOauthHttpRequest {
+            url: GITHUB_DEVICE_CODE_URL.to_string(),
             method: "POST".to_string(),
             headers: vec![
                 ("Accept".to_string(), "application/json".to_string()),
@@ -558,41 +530,99 @@ This extension requires an active GitHub Copilot subscription.
                     "application/x-www-form-urlencoded".to_string(),
                 ),
             ],
-            body: format!(
-                "client_id={}&code={}&redirect_uri=http://127.0.0.1:{}/callback&code_verifier={}",
-                GITHUB_COPILOT_CLIENT_ID, code, result.port, code_verifier
-            ),
+            body: format!("client_id={}&scope=read:user", GITHUB_COPILOT_CLIENT_ID),
         })?;
 
-        if token_response.status != 200 {
+        if device_code_response.status != 200 {
             return Err(format!(
-                "Token exchange failed: HTTP {}",
-                token_response.status
+                "Failed to get device code: HTTP {}",
+                device_code_response.status
             ));
         }
 
         #[derive(Deserialize)]
-        struct TokenResponse {
-            access_token: Option<String>,
-            error: Option<String>,
-            error_description: Option<String>,
+        struct DeviceCodeResponse {
+            device_code: String,
+            user_code: String,
+            verification_uri: String,
+            expires_in: u64,
+            interval: u64,
         }
 
-        let token_json: TokenResponse = serde_json::from_str(&token_response.body)
-            .map_err(|e| format!("Failed to parse token response: {}", e))?;
+        let device_info: DeviceCodeResponse = serde_json::from_str(&device_code_response.body)
+            .map_err(|e| format!("Failed to parse device code response: {}", e))?;
 
-        if let Some(error) = token_json.error {
-            let description = token_json.error_description.unwrap_or_default();
-            return Err(format!("OAuth error: {} - {}", error, description));
+        // Step 2: Open browser to verification URL with pre-filled user code
+        let verification_url = format!(
+            "{}?user_code={}",
+            device_info.verification_uri, device_info.user_code
+        );
+        llm_oauth_open_browser(&verification_url)?;
+
+        // Step 3: Poll for access token
+        let poll_interval = Duration::from_secs(device_info.interval.max(5));
+        let max_attempts = (device_info.expires_in / device_info.interval.max(5)) as usize;
+
+        for _ in 0..max_attempts {
+            thread::sleep(poll_interval);
+
+            let token_response = llm_oauth_http_request(&LlmOauthHttpRequest {
+                url: GITHUB_ACCESS_TOKEN_URL.to_string(),
+                method: "POST".to_string(),
+                headers: vec![
+                    ("Accept".to_string(), "application/json".to_string()),
+                    (
+                        "Content-Type".to_string(),
+                        "application/x-www-form-urlencoded".to_string(),
+                    ),
+                ],
+                body: format!(
+                    "client_id={}&device_code={}&grant_type=urn:ietf:params:oauth:grant-type:device_code",
+                    GITHUB_COPILOT_CLIENT_ID, device_info.device_code
+                ),
+            })?;
+
+            #[derive(Deserialize)]
+            struct TokenResponse {
+                access_token: Option<String>,
+                error: Option<String>,
+                error_description: Option<String>,
+            }
+
+            let token_json: TokenResponse = serde_json::from_str(&token_response.body)
+                .map_err(|e| format!("Failed to parse token response: {}", e))?;
+
+            if let Some(access_token) = token_json.access_token {
+                llm_store_credential("copilot-chat", &access_token)?;
+                return Ok(());
+            }
+
+            if let Some(error) = &token_json.error {
+                match error.as_str() {
+                    "authorization_pending" => {
+                        // User hasn't authorized yet, keep polling
+                        continue;
+                    }
+                    "slow_down" => {
+                        // Need to slow down polling
+                        thread::sleep(Duration::from_secs(5));
+                        continue;
+                    }
+                    "expired_token" => {
+                        return Err("Device code expired. Please try again.".to_string());
+                    }
+                    "access_denied" => {
+                        return Err("Authorization was denied.".to_string());
+                    }
+                    _ => {
+                        let description = token_json.error_description.unwrap_or_default();
+                        return Err(format!("OAuth error: {} - {}", error, description));
+                    }
+                }
+            }
         }
 
-        let access_token = token_json
-            .access_token
-            .ok_or("No access_token in response")?;
-
-        llm_store_credential("copilot-chat", &access_token)?;
-
-        Ok(())
+        Err("Authorization timed out. Please try again.".to_string())
     }
 
     fn llm_provider_reset_credentials(&mut self, _provider_id: &str) -> Result<(), String> {
@@ -772,95 +802,27 @@ This extension requires an active GitHub Copilot subscription.
     }
 }
 
-fn generate_random_state() -> String {
-    let mut rng = rand::thread_rng();
-    let bytes: [u8; 32] = rng.gen();
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-}
-
-fn generate_pkce_verifier() -> String {
-    let mut rng = rand::thread_rng();
-    let bytes: [u8; 32] = rng.gen();
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-}
-
-fn generate_pkce_challenge(verifier: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(verifier.as_bytes());
-    let hash = hasher.finalize();
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_pkce_challenge_generation() {
-        let verifier = generate_pkce_verifier();
-        let challenge = generate_pkce_challenge(&verifier);
-
-        // Verifier should be base64url encoded 32 bytes = 43 characters
-        assert_eq!(verifier.len(), 43);
-
-        // Challenge should be base64url encoded SHA256 hash = 43 characters
-        assert_eq!(challenge.len(), 43);
-
-        // Challenge should be deterministic for same verifier
-        let challenge2 = generate_pkce_challenge(&verifier);
-        assert_eq!(challenge, challenge2);
-
-        // Different verifiers should produce different challenges
-        let verifier2 = generate_pkce_verifier();
-        let challenge3 = generate_pkce_challenge(&verifier2);
-        assert_ne!(challenge, challenge3);
+    fn test_device_flow_request_body() {
+        let body = format!("client_id={}&scope=read:user", GITHUB_COPILOT_CLIENT_ID);
+        assert!(body.contains("client_id=Iv1.b507a08c87ecfe98"));
+        assert!(body.contains("scope=read:user"));
     }
 
     #[test]
-    fn test_auth_url_template_with_pkce() {
-        let state = "test_state";
-        let code_challenge = "test_challenge_abc123";
-        let template = format!(
-            "https://github.com/login/oauth/authorize?client_id={}&redirect_uri=http://127.0.0.1:{{port}}/callback&scope=read:user&state={}&code_challenge={}&code_challenge_method=S256",
-            GITHUB_COPILOT_CLIENT_ID, state, code_challenge
+    fn test_token_poll_request_body() {
+        let device_code = "test_device_code_123";
+        let body = format!(
+            "client_id={}&device_code={}&grant_type=urn:ietf:params:oauth:grant-type:device_code",
+            GITHUB_COPILOT_CLIENT_ID, device_code
         );
-
-        // Verify the template contains {port} placeholder
-        assert!(
-            template.contains("{port}"),
-            "Template should contain {{port}} placeholder, got: {}",
-            template
-        );
-
-        // Simulate what the host does
-        let port = 54321;
-        let final_url = template.replace("{port}", &port.to_string());
-
-        // Verify it's a valid URL with all expected params
-        let parsed = Url::parse(&final_url).expect("should be a valid URL");
-        assert_eq!(parsed.scheme(), "https");
-        assert_eq!(parsed.host_str(), Some("github.com"));
-        assert_eq!(parsed.path(), "/login/oauth/authorize");
-
-        let params: HashMap<_, _> = parsed.query_pairs().collect();
-        assert_eq!(
-            params.get("client_id").map(|s| s.as_ref()),
-            Some("Iv1.b507a08c87ecfe98")
-        );
-        assert_eq!(
-            params.get("redirect_uri").map(|s| s.as_ref()),
-            Some("http://127.0.0.1:54321/callback")
-        );
-        assert_eq!(params.get("scope").map(|s| s.as_ref()), Some("read:user"));
-        assert_eq!(params.get("state").map(|s| s.as_ref()), Some("test_state"));
-        assert_eq!(
-            params.get("code_challenge").map(|s| s.as_ref()),
-            Some("test_challenge_abc123")
-        );
-        assert_eq!(
-            params.get("code_challenge_method").map(|s| s.as_ref()),
-            Some("S256")
-        );
+        assert!(body.contains("client_id=Iv1.b507a08c87ecfe98"));
+        assert!(body.contains("device_code=test_device_code_123"));
+        assert!(body.contains("grant_type=urn:ietf:params:oauth:grant-type:device_code"));
     }
 }
 
